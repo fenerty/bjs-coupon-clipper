@@ -1,0 +1,13 @@
+.venv/
+.auth/
+.edge-profile/
+logs/
+artifacts/
+__pycache__/
+*.log
+.env
+.env.*
+
+# Legacy local Playwright prototype; not part of the userscript distribution.
+main.py
+requirements.txt

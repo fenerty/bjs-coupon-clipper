@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>BJ's Userscript Regression Fixture</title>
+<style>
+body { font: 16px Georgia, serif; margin: 24px; background: #f4f1eb; color: #222; }
+main { max-width: 960px; }
+#cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+[data-index] { padding: 12px; border: 1px solid #aaa; border-radius: 8px; background: white; }
+button { padding: 8px; cursor: pointer; }
+#result { position: sticky; top: 0; background: #ffe5a3; padding: 12px; z-index: 1; white-space: pre-wrap; }
+</style>
+<h1>BJ's Userscript Regression Fixture</h1>
+<pre id="result">Running...</pre>
+<main><div id="site"></div></main>
+<script>
+"use strict";
+const scenario = new URLSearchParams(location.search).get("case") || "rerender";
+const size = scenario === "205" ? 205 : scenario === "timeout" ? 1 : scenario === "paced" ? 4 : 14;
+const items = Array.from({length: size}, (_, id) => ({id, clipped: scenario === "zero"}));
+let loaded = scenario === "205" ? 180 : size;
+let requests = 0;
+let concurrent = 0;
+let maxConcurrent = 0;
+let cartClicks = 0;
+let activeTab = scenario !== "tab";
+let hidden = false;
+let requestsWhileHidden = 0;
+let enable = scenario !== "disabled";
+const attempts = new Map();
+const sentAt = [];
+// Control visibility deterministically without changing browser settings.
+Object.defineProperty(document, "hidden", {configurable: true, get: () => hidden});
+
+function render() {
+  const shown = items.slice(0, loaded).filter(item => scenario !== "removed" || !item.clipped);
+  const clipped = items.filter(item => item.clipped).length;
+  document.getElementById("site").innerHTML = '<h2>My Coupons</h2><ul><li data-testid="tab-available" class="' + (activeTab ? 'tab-active' : '') + '"><a>Available</a></li><li data-testid="tab-activated">Clipped (' + (547 + clipped) + ')</li></ul><ul><li>Showing' + size + ' Coupons</li></ul><div id="cards">' + shown.map(item =>
+    '<div id="card-' + item.id + '" data-index="card-' + item.id + '"><p data-testid="offer-summary">$2.00 OFF</p><p data-testid="coupon-datetime">Expires 11/02/26</p><p data-testid="offer-description">' + (scenario === 'duplicate' ? 'Same description on every coupon' : 'Coupon ' + item.id) + '</p>' +
+    (item.clipped ? '<span data-testid="clipped-badge">Clipped</span><button data-testid="add-to-cart">ADD TO CART</button>' : '<div role="button"><button name="clipToCard" data-testid="coupon-btn" data-auto-data="coupon_ClipToCard" data-fixture-id="' + item.id + '"' + (enable ? '' : ' disabled') + '>' + (scenario === 'legacy' ? '+ CLIP TO CARD' : 'CLIP') + '</button></div>') + '</div>'
+  ).join('') + '</div>';
+  document.querySelector('[data-testid="tab-available"]').addEventListener('click', () => {activeTab = true; render();});
+  document.querySelectorAll('[data-fixture-id]').forEach(node => node.addEventListener('click', () => handleClip(Number(node.dataset.fixtureId), node)));
+  document.querySelectorAll('[data-testid="add-to-cart"]').forEach(node => node.addEventListener('click', () => {cartClicks += 1;}));
+}
+
+function handleClip(id, node) {
+  requests += 1;
+  if (hidden) requestsWhileHidden += 1;
+  attempts.set(id, (attempts.get(id) || 0) + 1);
+  concurrent += 1;
+  maxConcurrent = Math.max(maxConcurrent, concurrent);
+  sentAt.push(performance.now());
+  if (scenario === 'timeout') { concurrent -= 1; return; }
+  if (scenario === 'rate-limit') {
+    concurrent -= 1;
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.textContent = 'Too many requests. Try again later.';
+    document.querySelector('main').appendChild(alert);
+    return;
+  }
+  node.disabled = true;
+  if (scenario === 'stop') setTimeout(() => document.querySelector('#bjs-coupon-clipper-overlay button:nth-child(2)').click(), 5);
+  if (scenario === 'background' && requests === 1) {
+    hidden = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    setTimeout(() => { hidden = false; document.dispatchEvent(new Event('visibilitychange')); }, 200);
+  }
+  setTimeout(() => {
+    items[id].clipped = true;
+    concurrent -= 1;
+    // Replace all cards, including the control that the userscript just clicked.
+    render();
+  }, 35);
+}
+
+window.addEventListener('scroll', () => {
+  if (scenario === '205' && loaded < size) { loaded = size; render(); }
+});
+render();
+if (scenario === 'disabled') setTimeout(() => { enable = true; document.querySelectorAll('[name="clipToCard"]').forEach(n => {n.disabled = false;}); }, 100);
+
+async function verify() {
+  document.querySelector('#bjs-coupon-clipper-overlay button').click();
+  const deadline = performance.now() + 20000;
+  let startButton;
+  do {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    startButton = document.querySelector('#bjs-coupon-clipper-overlay button');
+  } while (startButton.disabled && performance.now() < deadline);
+  const stats = document.querySelector('[data-role="stats"]').textContent;
+  const status = document.querySelector('[data-role="status"]').textContent;
+  const counts = Object.fromEntries(Array.from(stats.matchAll(/(found|clicked|skipped|failed)=(\d+)/g), m => [m[1], Number(m[2])]));
+  const assertions = [];
+  function check(condition, message) { if (!condition) assertions.push(message); }
+  check(!startButton.disabled, 'Run did not finish');
+  check(maxConcurrent <= 1, 'Concurrent requests were sent');
+  check(Array.from(attempts.values()).every(n => n === 1), 'A coupon was clicked more than once');
+  check(cartClicks === 0, 'Clicked ADD TO CART');
+  check(requestsWhileHidden === 0, 'Sent a request while the tab was hidden');
+  if (scenario === 'timeout' || scenario === 'rate-limit') {
+    check(counts.found === size && counts.clicked === 0 && counts.failed === 1, 'Unconfirmed request counters are wrong: ' + stats);
+    check(requests === 1 && status.startsWith('Stopped'), 'Failure was retried or did not stop');
+  } else if (scenario === 'stop') {
+    check(counts.found === size && counts.clicked === 1 && counts.failed === 0, 'Stop counters are wrong: ' + stats);
+    check(requests === 1 && status === 'Stopped by you', 'Stop sent more requests');
+  } else if (scenario === 'zero') {
+    check(counts.found === 0 && counts.clicked === 0 && requests === 0 && status === 'Finished', 'Already-clipped coupons were counted or clicked');
+  } else {
+    check(counts.found === size && counts.clicked === size && counts.skipped === 0 && counts.failed === 0, 'Counters are wrong: ' + stats);
+    check(requests === size && status === 'Finished', 'Did not clip every coupon');
+  }
+  if (scenario === 'paced') check(sentAt.slice(1).every((t,i) => t - sentAt[i] >= 430), 'Requests exceeded the production rate');
+  document.getElementById('result').textContent = (assertions.length ? 'FAIL' : 'PASS') + ' ' + scenario + '\n' + JSON.stringify({counts, requests, maxConcurrent, cartClicks, requestsWhileHidden, assertions}, null, 2);
+}
+</script>
+<script src="/bjs-coupons.user.js"></script>
+<script>verify().catch(error => { document.getElementById('result').textContent = 'FAIL ' + error.stack; });</script>
+</html>
